@@ -1,0 +1,5 @@
+enron_data_fraud_labeled.*
+dataset/**.csv
+dataset/**.zip
+__pycache__/**
+progress.txt
