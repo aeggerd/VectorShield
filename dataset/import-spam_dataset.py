@@ -33,6 +33,7 @@ for index, row in data.iterrows():
         "subject": "",
         "body": base64.b64encode(email_content.encode("utf-8")).decode("utf-8"),
         "sender": "",
+        "customerId": "99999",
         "type": email_type
     }
 

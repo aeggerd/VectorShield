@@ -44,6 +44,7 @@ packaging==24.2
 pandas==2.2.3
 pillow==11.1.0
 portalocker==2.10.1
+prometheus_client==0.21.1
 protobuf==5.29.3
 pydantic==2.10.6
 pydantic_core==2.27.2
