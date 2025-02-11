@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>VectorShield - Email Analysis UI</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-100">
+
+    <div class="container mx-auto p-6">
+        <h1 class="text-4xl font-bold text-center text-blue-600 mb-4">VectorShield - Email Analysis UI</h1>
+
+        <div class="tabs flex justify-center space-x-4 mb-6">
+            <button class="tab-button active" onclick="showTab('analyze')">Analyze Email</button>
+            <button class="tab-button" onclick="showTab('insert')">Insert Email</button>
+            <button class="tab-button" onclick="showTab('false_positive')">Report False Positive</button>
+            <button class="tab-button" onclick="showTab('upload')">Upload EML File</button>
+        </div>
+
+        <!-- Analyze Email Tab -->
+        <div id="analyze" class="tab-content active">
+            <h2 class="text-2xl font-semibold mb-4">Analyze Email</h2>
+            <form id="analyzeForm" class="bg-white p-4 shadow rounded">
+                <label for="subject">Subject:</label>
+                <input type="text" id="subject" name="subject" class="input-field" required><br>
+                <label for="body">Body:</label>
+                <textarea id="body" name="body" class="input-field" rows="4" required></textarea><br>
+                <label for="sender">Sender:</label>
+                <input type="email" id="sender" name="sender" class="input-field" required><br>
+                <button type="submit" class="submit-button bg-blue-500 text-white">Analyze</button>
+            </form>
+            <div id="analyzeResult" class="result-box mt-4"></div>
+        </div>
+
+        <!-- Insert Email Tab -->
+        <div id="insert" class="tab-content">
+            <h2 class="text-2xl font-semibold mb-4">Insert Email</h2>
+            <form id="insertForm" class="bg-white p-4 shadow rounded">
+                <label for="insert_subject">Subject:</label>
+                <input type="text" id="insert_subject" name="subject" class="input-field" required><br>
+                <label for="insert_body">Body:</label>
+                <textarea id="insert_body" name="body" class="input-field" rows="4" required></textarea><br>
+                <label for="insert_sender">Sender:</label>
+                <input type="email" id="insert_sender" name="sender" class="input-field" required><br>
+                <label for="email_type">Type:</label>
+                <select id="email_type" name="type" class="input-field" required>
+                    <option value="phishing">Phishing</option>
+                    <option value="legitimate">Legitimate</option>
+                </select><br>
+                <button type="submit" class="submit-button bg-green-500 text-white">Insert</button>
+            </form>
+            <div id="insertResult" class="result-box mt-4"></div>
+        </div>
+
+        <!-- Report False Positive Tab -->
+        <div id="false_positive" class="tab-content">
+            <h2 class="text-2xl font-semibold mb-4">Report False Positive</h2>
+            <form id="falsePositiveForm" class="bg-white p-4 shadow rounded">
+                <label for="fp_subject">Subject:</label>
+                <input type="text" id="fp_subject" name="subject" class="input-field" required><br>
+                <label for="fp_body">Body:</label>
+                <textarea id="fp_body" name="body" class="input-field" rows="4" required></textarea><br>
+                <label for="fp_sender">Sender:</label>
+                <input type="email" id="fp_sender" name="sender" class="input-field" required><br>
+                <button type="submit" class="submit-button bg-red-500 text-white">Report False Positive</button>
+            </form>
+            <div id="fpResult" class="result-box mt-4"></div>
+        </div>
+
+        <!-- Upload EML File Tab -->
+        <div id="upload" class="tab-content">
+            <h2 class="text-2xl font-semibold mb-4">Upload EML File</h2>
+            <form id="uploadForm" class="bg-white p-4 shadow rounded" enctype="multipart/form-data">
+                <label for="eml_file">Select EML File:</label>
+                <input type="file" id="eml_file" name="file" class="input-field" accept=".eml" required><br>
+                <button type="submit" class="submit-button bg-yellow-500 text-white">Upload and Parse</button>
+            </form>
+            <div id="uploadResult" class="result-box mt-4"></div>
+        </div>
+
+    </div>
+
+    <script>
+        // Handle tab switching
+        function showTab(tabId) {
+            document.querySelectorAll(".tab-content").forEach(tab => tab.classList.remove("active"));
+            document.querySelectorAll(".tab-button").forEach(button => button.classList.remove("active"));
+            document.getElementById(tabId).classList.add("active");
+            document.querySelector(`button[onclick="showTab('${tabId}')"]`).classList.add("active");
+        }
+
+        // Function to handle form submissions and API calls
+        async function handleFormSubmit(event, formId, apiUrl, resultId) {
+            event.preventDefault();
+            const form = document.getElementById(formId);
+            const formData = new FormData(form);
+            const jsonObject = Object.fromEntries(formData);
+            jsonObject.body = btoa(jsonObject.body); // Encode body in Base64
+
+            try {
+                const response = await fetch(apiUrl, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify(jsonObject)
+                });
+
+                const result = await response.json();
+                document.getElementById(resultId).innerText = response.ok ? JSON.stringify(result, null, 2) : result.detail;
+            } catch (error) {
+                document.getElementById(resultId).innerText = `Error: ${error.message}`;
+            }
+        }
+
+        // Analyze Email Form
+        document.getElementById("analyzeForm").addEventListener("submit", (event) => {
+            handleFormSubmit(event, "analyzeForm", "/analyze", "analyzeResult");
+        });
+
+        // Insert Email Form
+        document.getElementById("insertForm").addEventListener("submit", (event) => {
+            handleFormSubmit(event, "insertForm", "/insert", "insertResult");
+        });
+
+        // Report False Positive Form
+        document.getElementById("falsePositiveForm").addEventListener("submit", (event) => {
+            handleFormSubmit(event, "falsePositiveForm", "/report_false_positive", "fpResult");
+        });
+
+        // Handle EML Upload and Parsing
+        document.getElementById("uploadForm").addEventListener("submit", async (event) => {
+            event.preventDefault();
+            const fileInput = document.getElementById("eml_file");
+            const file = fileInput.files[0];
+            const formData = new FormData();
+            formData.append("file", file);
+
+            try {
+                const response = await fetch("/parse_eml", { method: "POST", body: formData });
+                const result = await response.json();
+                document.getElementById("uploadResult").innerText = response.ok ? JSON.stringify(result, null, 2) : result.detail;
+            } catch (error) {
+                document.getElementById("uploadResult").innerText = `Error: ${error.message}`;
+            }
+        });
+    </script>
+
+</body>
+</html>

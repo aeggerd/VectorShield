@@ -9,6 +9,11 @@ from collections import deque
 from functools import lru_cache
 from typing import List, Optional
 
+import email
+from email import policy
+from email.parser import BytesParser
+from fastapi import File, UploadFile
+from io import BytesIO
 import numpy as np
 from bs4 import BeautifulSoup
 from fastapi import FastAPI, HTTPException, Request
@@ -393,6 +398,51 @@ def report_false_positive(email: EmailRequest):
     else:
         logger.warning(f"Email not found in the database: {email_features['subject']}")
         raise HTTPException(status_code=404, detail="Email not found in the database.")
+
+@app.post("/parse_eml", summary="Parse EML File", description="Parses an uploaded EML file and extracts email details.")
+async def parse_eml(file: UploadFile = File(...)):
+    """Parses an uploaded EML file and extracts the subject, body, sender, and other email metadata."""
+    try:
+        # Read the uploaded file
+        eml_content = await file.read()
+        
+        # Parse the EML file
+        msg = BytesParser(policy=policy.default).parsebytes(eml_content)
+
+        # Extract basic email components
+        subject = msg["subject"] if msg["subject"] else "No Subject"
+        sender = msg["from"] if msg["from"] else "Unknown Sender"
+        body = extract_eml_body(msg)
+
+        # Prepare the response
+        parsed_email = {
+            "subject": subject,
+            "body": base64.b64encode(body.encode("utf-8")).decode("utf-8"),
+            "sender": sender
+        }
+
+        logger.info(f"Parsed EML file: subject={subject}, sender={sender}")
+        return {"message": "✅ Successfully parsed EML file", "email": parsed_email}
+
+    except Exception as e:
+        logger.error(f"Failed to parse EML file: {e}")
+        raise HTTPException(status_code=400, detail=f"Failed to parse EML file: {e}")
+
+def extract_eml_body(msg):
+    """Extracts the plain text or HTML body from an email message."""
+    if msg.is_multipart():
+        for part in msg.walk():
+            content_type = part.get_content_type()
+            content_disposition = str(part.get("Content-Disposition"))
+
+            # Prefer plain text, but fallback to HTML if necessary
+            if content_type == "text/plain" and "attachment" not in content_disposition:
+                return part.get_payload(decode=True).decode(errors="replace")
+            elif content_type == "text/html" and "attachment" not in content_disposition:
+                return BeautifulSoup(part.get_payload(decode=True).decode(errors="replace"), "html.parser").get_text()
+
+    # Fallback for non-multipart emails
+    return msg.get_payload(decode=True).decode(errors="replace")
 
 # -------------------------------------------------------
 # 9) Run with Uvicorn:
