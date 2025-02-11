@@ -12,12 +12,13 @@ from typing import List, Optional
 import email
 from email import policy
 from email.parser import BytesParser
-from fastapi import File, UploadFile
 from io import BytesIO
+
 import numpy as np
 from bs4 import BeautifulSoup
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import File, UploadFile, FastAPI, HTTPException, Request
 from fastapi.responses import Response
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from qdrant_client import QdrantClient
 from qdrant_client.http.exceptions import UnexpectedResponse
@@ -39,18 +40,15 @@ from prometheus_client import (
 from starlette.middleware.base import BaseHTTPMiddleware
 
 # -------------------------------------------------------
-# 1) Logging Setup (Unified for Uvicorn + App)
+# Logging Setup
 # -------------------------------------------------------
-
 LOG_LEVEL = "INFO"
 LOG_FORMAT = "[%(asctime)s] %(levelname)s %(name)s - %(message)s"
 
-# Set up a root logger
 logging.basicConfig(level=LOG_LEVEL, format=LOG_FORMAT)
 logger = logging.getLogger("phishing_api")
 logger.setLevel(logging.INFO)
 
-# Force Uvicorn loggers to use the same handlers/format:
 uvicorn_logger = logging.getLogger("uvicorn")
 uvicorn_logger.handlers = logger.handlers
 uvicorn_logger.setLevel(logging.INFO)
@@ -64,14 +62,13 @@ uvicorn_access_logger.handlers = logger.handlers
 uvicorn_access_logger.setLevel(logging.INFO)
 
 # -------------------------------------------------------
-# 2) Prometheus Metrics & Middleware
+# Prometheus Metrics & Middleware
 # -------------------------------------------------------
 REQUEST_LATENCY = Histogram(
     "request_duration_seconds",
     "Request duration in seconds",
     ["method", "path"]
 )
-
 REQUEST_COUNT = Counter(
     "request_count",
     "Number of requests by method, path and HTTP status",
@@ -79,9 +76,6 @@ REQUEST_COUNT = Counter(
 )
 
 class PrometheusMiddleware(BaseHTTPMiddleware):
-    """
-    Middleware to record request duration and status codes for Prometheus.
-    """
     async def dispatch(self, request: Request, call_next):
         start_time = time.time()
         response = await call_next(request)
@@ -91,20 +85,27 @@ class PrometheusMiddleware(BaseHTTPMiddleware):
         path = request.url.path
         status_code = response.status_code
 
-        # Record metrics
         REQUEST_LATENCY.labels(method=method, path=path).observe(request_duration)
         REQUEST_COUNT.labels(method=method, path=path, status_code=status_code).inc()
 
         return response
 
 # -------------------------------------------------------
-# 3) FastAPI Initialization
+# FastAPI Initialization
 # -------------------------------------------------------
 app = FastAPI(title="Phishing Detection API", version="1.0.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],       # or specify ["http://localhost:8000"] for stricter security
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 app.add_middleware(PrometheusMiddleware)
 
+
 # -------------------------------------------------------
-# 4) Qdrant Setup
+# Qdrant Setup
 # -------------------------------------------------------
 client = QdrantClient("http://michael-XPS-13-9360:6333")
 COLLECTION_NAME = "emails"
@@ -123,50 +124,38 @@ except UnexpectedResponse as e:
         raise
 
 # -------------------------------------------------------
-# 5) Prepare background batch upsert
+# Prepare background batch upsert
 # -------------------------------------------------------
 batch_queue = deque()
-BATCH_SIZE = 10  # Flush after 10 inserts
-FLUSH_INTERVAL = 5  # ...or after 5 seconds if not reached 10 inserts
+BATCH_SIZE = 10  # flush after 10 inserts
+FLUSH_INTERVAL = 5  # or after 5s if not reached 10
 
-# Load embedding model
 model = SentenceTransformer("all-MiniLM-L6-v2")
 
 @lru_cache(maxsize=1000)
-def get_cached_embedding(vector_text: str):
-    """Returns a cached embedding or computes it if not in cache."""
-    return model.encode([vector_text], convert_to_numpy=True).tolist()[0]
+def get_cached_embedding(text: str):
+    return model.encode([text], show_progress_bar=False, convert_to_numpy=True).tolist()[0]
+    #return model.encode([text], convert_to_numpy=True).tolist()[0]
 
 async def batch_upsert():
-    """
-    Performs batch upsert to Qdrant when the queue reaches BATCH_SIZE
-    or 5 seconds have passed since last flush, whichever comes first.
-    """
     last_upsert_time = time.time()
-
     while True:
         elapsed = time.time() - last_upsert_time
-        # If queue is big enough OR enough time has elapsed, flush
         if len(batch_queue) >= BATCH_SIZE or (elapsed >= FLUSH_INTERVAL and len(batch_queue) > 0):
-            # Take all points in the queue and upsert them
             points = []
             while batch_queue:
                 points.append(batch_queue.popleft())
-
             client.upsert(COLLECTION_NAME, points)
             logger.info(f"✅ Upserted {len(points)} points to Qdrant.")
-
             last_upsert_time = time.time()
-
         await asyncio.sleep(1)
 
 @app.on_event("startup")
 async def startup_event():
-    """Startup event to initialize background batch processing."""
     asyncio.create_task(batch_upsert())
 
 # -------------------------------------------------------
-# 6) Pydantic Models
+# Pydantic Models
 # -------------------------------------------------------
 class EmailRequest(BaseModel):
     subject: str
@@ -175,7 +164,7 @@ class EmailRequest(BaseModel):
     reply_to: Optional[str] = None
     attachments: Optional[List[str]] = []
     type: Optional[str] = None
-    customerId: Optional[str] = None  # to separate emails by customer
+    customerId: Optional[str] = None
 
 class AnalyzeResponse(BaseModel):
     phishing_score: int
@@ -184,36 +173,42 @@ class AnalyzeResponse(BaseModel):
     reasons: List[str]
 
 # -------------------------------------------------------
-# 7) Utility Functions
+# Utilities
 # -------------------------------------------------------
 def extract_urls(text: str) -> List[str]:
-    """Extract all http/https URLs from text."""
-    url_regex = r"https?://[^\s\"<>]+"
-    return re.findall(url_regex, text)
+    return re.findall(r"https?://[^\s\"<>]+", text)
+
+def extract_eml_body(msg):
+    if msg.is_multipart():
+        for part in msg.walk():
+            ctype = part.get_content_type()
+            cdisp = str(part.get("Content-Disposition"))
+            if ctype == "text/plain" and "attachment" not in cdisp:
+                return part.get_payload(decode=True).decode(errors="replace")
+            elif ctype == "text/html" and "attachment" not in cdisp:
+                return BeautifulSoup(
+                    part.get_payload(decode=True).decode(errors="replace"), "html.parser"
+                ).get_text()
+    return msg.get_payload(decode=True).decode(errors="replace")
 
 def extract_email_features(email: EmailRequest):
-    """Extract relevant features (subject, body preview, links, domains, etc.)."""
     decoded_body = base64.b64decode(email.body)
-    # Safely decode up to 200 characters to avoid extremely large logs
     body_text = decoded_body[:200].decode(errors="replace")
 
     subject = email.subject
     sender = email.sender
     reply_to = email.reply_to or sender
-    attachments = email.attachments or []
-    customer_id = email.customerId  # We'll store it in the payload
+    customer_id = email.customerId
 
     sender_domain = sender.split("@")[-1] if "@" in sender else "unknown"
     reply_to_domain = reply_to.split("@")[-1] if "@" in reply_to else "unknown"
 
-    # Extract links (both HTML-based and text-based)
     soup = BeautifulSoup(decoded_body, "html.parser")
     html_links = [a['href'] for a in soup.find_all('a', href=True)]
     text_links = extract_urls(decoded_body.decode(errors="replace"))
-
     merged_links = list(set(html_links + text_links))
 
-    # Create a hash that identifies the email content (for stable ID creation)
+    # For stable ID creation
     email_string = subject + body_text + "".join(merged_links) + sender_domain
     email_hash = hashlib.sha256(email_string.encode()).hexdigest()
 
@@ -223,54 +218,38 @@ def extract_email_features(email: EmailRequest):
         "links": merged_links,
         "sender_domain": sender_domain,
         "reply_to_domain": reply_to_domain,
-        "attachments": attachments,
+        "attachments": email.attachments or [],
         "email_hash": email_hash,
         "customerId": customer_id,
     }
 
 def store_email(email: EmailRequest, label: str) -> str:
-    """Prepare and queue an email for batch insertion into Qdrant."""
-    email_features = extract_email_features(email)
-    email_features["label"] = label
+    feats = extract_email_features(email)
+    feats["label"] = label
 
-    # Create a stable ID by hashing content + label
-    email_id_str = email_features["email_hash"] + label
+    email_id_str = feats["email_hash"] + label
     email_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, email_id_str))
 
-    # Prepare the text for embedding
-    vector_text = f"{email_features['subject']} {email_features['body_preview']} {' '.join(email_features['links'])}"
+    vector_text = f"{feats['subject']} {feats['body_preview']} {' '.join(feats['links'])}"
     vector_embedding = get_cached_embedding(vector_text)
 
-    point = PointStruct(
-        id=email_id,
-        vector=vector_embedding,
-        payload=email_features
-    )
-
-    # Queue the point for asynchronous batch upsert
+    point = PointStruct(id=email_id, vector=vector_embedding, payload=feats)
     batch_queue.append(point)
-    logger.info(
-        f"Queued {label} email: {email_features['subject']} "
-        f"(customerId={email_features.get('customerId')}, ID={email_id})"
-    )
-    return f"✅ Queued {label} email: {email_features['subject']}"
 
-def check_email_similarity(email_features):
-    """
-    Search for up to 5 similar emails for the same customerId (if provided),
-    compute a phishing score, and determine the closest label.
-    """
-    vector_text = f"{email_features['subject']} {email_features['body_preview']} {' '.join(email_features['links'])}"
+    logger.info(f"Queued {label} email: {feats['subject']} (ID={email_id}, custId={feats.get('customerId')})")
+    return f"✅ Queued {label} email: {feats['subject']}"
+
+def check_email_similarity(email_feats):
+    vector_text = f"{email_feats['subject']} {email_feats['body_preview']} {' '.join(email_feats['links'])}"
     vector_embedding = get_cached_embedding(vector_text)
 
-    # Filter by customerId if provided
     filter_ = None
-    if email_features.get("customerId"):
+    if email_feats.get("customerId"):
         filter_ = Filter(
-            must=[FieldCondition(key="customerId", match=MatchValue(value=email_features["customerId"]))]
+            must=[FieldCondition(key="customerId", match=MatchValue(value=email_feats["customerId"]))]
         )
 
-    search_result = client.search(
+    results = client.search(
         collection_name=COLLECTION_NAME,
         query_vector=vector_embedding,
         query_filter=filter_,
@@ -279,172 +258,119 @@ def check_email_similarity(email_features):
 
     phishing_score = 0.0
     phishing_matches = []
-    legitimate_matches = []
+    legit_matches = []
     max_similarity = 0.0
     closest_label = None
 
-    for result in search_result:
-        similarity = result.score
-        label = result.payload.get("label", "unknown")
+    for r in results:
+        sim = r.score
+        lbl = r.payload.get("label", "unknown")
+        if sim > max_similarity:
+            max_similarity = sim
+            closest_label = lbl
+        if lbl == "phishing":
+            phishing_score += 50 * sim
+            phishing_matches.append(r.payload.get("subject", "Unknown"))
+        elif lbl == "legitimate":
+            phishing_score -= 20 * sim
+            legit_matches.append(r.payload.get("subject", "Unknown"))
 
-        # Track highest similarity
-        if similarity > max_similarity:
-            max_similarity = similarity
-            closest_label = label
-
-        # Weighted scoring by similarity
-        if label == "phishing":
-            # heavily penalize if we see a close phishing match
-            phishing_score += 50 * similarity
-            phishing_matches.append(result.payload.get("subject", "Unknown"))
-        elif label == "legitimate":
-            # reduce penalty if we see a close legitimate match
-            phishing_score -= 20 * similarity
-            legitimate_matches.append(result.payload.get("subject", "Unknown"))
-
-    # Clamp final phishing_score to [0, 100]
-    if phishing_score < 0:
-        phishing_score = 0
-    elif phishing_score > 100:
-        phishing_score = 100
-
+    phishing_score = min(max(phishing_score, 0), 100)  # clamp 0-100
     phishing_score = int(phishing_score)
+
     reasons = []
     if phishing_matches:
         reasons.append(f"Similar to known phishing emails: {phishing_matches}")
-    if not phishing_matches and not legitimate_matches:
+    if not phishing_matches and not legit_matches:
         reasons.append("No strong phishing or legitimate indicators found.")
 
     return phishing_score, reasons, closest_label
 
 # -------------------------------------------------------
-# 8) API Endpoints
+# API Endpoints
 # -------------------------------------------------------
-
-@app.get("/metrics", summary="Prometheus metrics")
+@app.get("/metrics")
 def metrics():
-    """
-    Expose Prometheus metrics at /metrics
-    """
     return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
-@app.post("/insert", summary="Insert Email", description="Inserts an email into Qdrant with classification (phishing or legitimate).")
+@app.post("/insert")
 def insert_email(email: EmailRequest):
-    logger.info(f"Received /insert request with subject: {email.subject}")
-    email_type = email.type.lower() if email.type else ""
-    if email_type not in ["phishing", "legitimate"]:
-        logger.error("Invalid email type supplied. Must be 'phishing' or 'legitimate'.")
-        raise HTTPException(status_code=400, detail="Invalid email type. Must be 'phishing' or 'legitimate'.")
+    logger.info(f"[/insert] subject={email.subject}")
+    typ = email.type.lower() if email.type else ""
+    if typ not in ["phishing", "legitimate"]:
+        raise HTTPException(status_code=400, detail="Invalid email type.")
+    msg = store_email(email, typ)
+    return {"message": msg}
 
-    message = store_email(email, email_type)
-    return {"message": message}
-
-@app.post("/analyze", response_model=AnalyzeResponse, summary="Analyze Email", description="Analyzes an email and returns a phishing probability percentage.")
+@app.post("/analyze", response_model=AnalyzeResponse)
 def analyze_email(email: EmailRequest):
-    logger.info(f"Received /analyze request with subject: {email.subject}")
-    email_features = extract_email_features(email)
-    phishing_score, reasons, closest_label = check_email_similarity(email_features)
+    logger.info(f"[/analyze] subject={email.subject}")
+    feats = extract_email_features(email)
+    score, reasons, closest_label = check_email_similarity(feats)
 
-    if phishing_score >= 70:
-        confidence_level = "High"
-    elif phishing_score >= 40:
-        confidence_level = "Medium"
+    if score >= 70:
+        conf = "High"
+    elif score >= 40:
+        conf = "Medium"
     else:
-        confidence_level = "Low"
+        conf = "Low"
 
-    logger.info(
-        f"Analysis result: phishing_score={phishing_score}, "
-        f"confidence_level={confidence_level}, closest_match={closest_label}, "
-        f"customerId={email_features.get('customerId')}"
-    )
-
+    logger.info(f"Analyzed -> score={score}, conf={conf}, label={closest_label}")
     return AnalyzeResponse(
-        phishing_score=phishing_score,
-        confidence_level=confidence_level,
+        phishing_score=score,
+        confidence_level=conf,
         closest_match=closest_label,
         reasons=reasons
     )
 
-@app.post("/report_false_positive", summary="Report False Positive", description="Removes a falsely flagged email from Qdrant.")
+@app.post("/report_false_positive")
 def report_false_positive(email: EmailRequest):
-    logger.info(f"Received /report_false_positive with subject: {email.subject}")
-    email_features = extract_email_features(email)
+    logger.info(f"[/report_false_positive] subject={email.subject}")
+    feats = extract_email_features(email)
 
-    vector_text = f"{email_features['subject']} {email_features['body_preview']} {' '.join(email_features['links'])}"
-    vector_embedding = get_cached_embedding(vector_text)
+    vector_text = f"{feats['subject']} {feats['body_preview']} {' '.join(feats['links'])}"
+    vec = get_cached_embedding(vector_text)
 
-    # Filter by customerId if provided
-    filter_ = None
-    if email_features.get("customerId"):
-        filter_ = Filter(
-            must=[FieldCondition(key="customerId", match=MatchValue(value=email_features["customerId"]))]
-        )
+    filt = None
+    if feats.get("customerId"):
+        filt = Filter(must=[FieldCondition(key="customerId", match=MatchValue(value=feats["customerId"]))])
 
-    search_result = client.search(
+    res = client.search(
         collection_name=COLLECTION_NAME,
-        query_vector=vector_embedding,
-        query_filter=filter_,
+        query_vector=vec,
+        query_filter=filt,
         limit=1
     )
-
-    if search_result:
-        email_id = search_result[0].id
-        client.delete(
-            collection_name=COLLECTION_NAME,
-            points_selector=[email_id]  # pass as list of IDs
-        )
-        logger.info(f"Removed false positive email: {email_features['subject']} (ID={email_id})")
-        return {"message": f"✅ Removed false positive email: {email_features['subject']}"}
+    if res:
+        e_id = res[0].id
+        client.delete(collection_name=COLLECTION_NAME, points_selector=[e_id])
+        logger.info(f"Removed false positive: {feats['subject']} (ID={e_id})")
+        return {"message": f"Removed false positive email: {feats['subject']}"}
     else:
-        logger.warning(f"Email not found in the database: {email_features['subject']}")
-        raise HTTPException(status_code=404, detail="Email not found in the database.")
+        logger.warning("Email not found.")
+        raise HTTPException(status_code=404, detail="Email not found in DB.")
 
-@app.post("/parse_eml", summary="Parse EML File", description="Parses an uploaded EML file and extracts email details.")
+@app.post("/parse_eml")
 async def parse_eml(file: UploadFile = File(...)):
-    """Parses an uploaded EML file and extracts the subject, body, sender, and other email metadata."""
     try:
-        # Read the uploaded file
-        eml_content = await file.read()
-        
-        # Parse the EML file
-        msg = BytesParser(policy=policy.default).parsebytes(eml_content)
+        eml_bytes = await file.read()
+        msg = BytesParser(policy=policy.default).parsebytes(eml_bytes)
 
-        # Extract basic email components
-        subject = msg["subject"] if msg["subject"] else "No Subject"
-        sender = msg["from"] if msg["from"] else "Unknown Sender"
+        subject = msg["subject"] or "No Subject"
+        sender = msg["from"] or "Unknown Sender"
         body = extract_eml_body(msg)
 
-        # Prepare the response
         parsed_email = {
             "subject": subject,
             "body": base64.b64encode(body.encode("utf-8")).decode("utf-8"),
             "sender": sender
         }
-
-        logger.info(f"Parsed EML file: subject={subject}, sender={sender}")
-        return {"message": "✅ Successfully parsed EML file", "email": parsed_email}
-
+        return {"message": "Parsed EML", "email": parsed_email}
     except Exception as e:
-        logger.error(f"Failed to parse EML file: {e}")
-        raise HTTPException(status_code=400, detail=f"Failed to parse EML file: {e}")
+        logger.error(f"Failed to parse EML: {e}")
+        raise HTTPException(status_code=400, detail=f"Failed to parse EML: {e}")
 
-def extract_eml_body(msg):
-    """Extracts the plain text or HTML body from an email message."""
-    if msg.is_multipart():
-        for part in msg.walk():
-            content_type = part.get_content_type()
-            content_disposition = str(part.get("Content-Disposition"))
 
-            # Prefer plain text, but fallback to HTML if necessary
-            if content_type == "text/plain" and "attachment" not in content_disposition:
-                return part.get_payload(decode=True).decode(errors="replace")
-            elif content_type == "text/html" and "attachment" not in content_disposition:
-                return BeautifulSoup(part.get_payload(decode=True).decode(errors="replace"), "html.parser").get_text()
-
-    # Fallback for non-multipart emails
-    return msg.get_payload(decode=True).decode(errors="replace")
-
-# -------------------------------------------------------
-# 9) Run with Uvicorn:
-#    uvicorn app:app --host 0.0.0.0 --port 5000 --reload
-# -------------------------------------------------------
+##
+# uvicorn app:app --host 0.0.0.0 --port 5000 --reload
+##
