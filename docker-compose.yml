@@ -2,7 +2,7 @@ version: "3.8"
 
 services:
   qdrant:
-    image: qdrant/qdrant
+    image: docker.repo.de.service.retloc/qdrant/qdrant
     container_name: qdrant
     ports:
       - "6333:6333"

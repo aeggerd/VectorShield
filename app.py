@@ -107,7 +107,7 @@ app.add_middleware(PrometheusMiddleware)
 # -------------------------------------------------------
 # Qdrant Setup
 # -------------------------------------------------------
-client = QdrantClient("http://michael-XPS-13-9360:6333")
+client = QdrantClient("http://192.168.117.177:6333")
 COLLECTION_NAME = "emails"
 
 try:
