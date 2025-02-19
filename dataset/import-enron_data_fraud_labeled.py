@@ -2,7 +2,6 @@ import os
 import pandas as pd
 import requests
 import base64
-import random
 import time
 
 # -------------------------------
@@ -47,13 +46,17 @@ if len(data) < sample_size:
     print(f"⚠ The dataset has fewer than {sample_size} entries. Testing all available rows.")
     sample_data = data
 else:
-    sample_data = data.sample(n=sample_size, random_state=time.time())
+    sample_data = data.sample(n=sample_size, random_state=int(time.time()))
 
 # Metrics counters
 total_tested = 0
 correct_classifications = 0
 false_positives = 0  # predicted phishing, actually legitimate
 false_negatives = 0  # predicted legitimate, actually phishing
+
+# Count of phishing (spam) and legitimate (ham) emails
+spam_count = 0  # Number of phishing emails tested
+ham_count = 0   # Number of legitimate emails tested
 
 # -------------------------------
 # 🔍 Validate Each Email
@@ -67,12 +70,15 @@ for index, row in sample_data.iterrows():
         label_raw = row["Label"] if pd.notna(row["Label"]) else 0  # fallback to 0 if missing
         expected_type = get_email_type(label_raw)
 
+        # Count email type occurrences
+        if expected_type == "phishing":
+            spam_count += 1
+        else:
+            ham_count += 1
+
         # If Body is empty or very short, skip or handle as needed
         if not email_body_raw.strip():
-            # Optionally skip or proceed with empty body
-            # print(f"Skipping row {index} due to empty email body.")
-            # continue
-            pass
+            pass  # Optionally skip or continue
 
         # Base64-encode the body for the request
         encoded_body = base64.b64encode(email_body_raw.encode("utf-8")).decode("utf-8")
@@ -117,6 +123,8 @@ else:
 
     print("\n📊 Test Summary:")
     print(f"Total Emails Tested: {total_tested}")
+    print(f"Total Spam Emails Tested: {spam_count}")
+    print(f"Total Ham Emails Tested: {ham_count}")
     print(f"Correct Classifications: {correct_classifications}")
     print(f"False Positives: {false_positives} ({false_positive_rate:.2f}%)")
     print(f"False Negatives: {false_negatives} ({false_negative_rate:.2f}%)")
